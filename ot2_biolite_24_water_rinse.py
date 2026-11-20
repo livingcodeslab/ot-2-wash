@@ -1,5 +1,10 @@
 """Supervised water rinse for an empty BioLite 24-well plate.
 
+Select "Final drain only" for the separate center draw from an already rinsed
+well A1 on the stationary shaker. Use a fresh C1 tip and enter the deepest
+clear working position verified for that setup, measured below the A1 rim.
+Bay 3 lane A12 must have room for another 200 uL. This mode adds no water.
+
 Match the deck before running:
     2   Open Opentrons OT-2 200 uL filter tip rack. Start at A1, or select
         "A1 tip already used" to start at B1 after a dry check. A whole-plate
@@ -59,6 +64,18 @@ SOURCE_RESERVE_UL = 2000
 
 
 def add_parameters(parameters):
+    parameters.add_bool(
+        variable_name="final_drain_only",
+        display_name="Final drain only",
+        description="Draw residual water from plate A1 using a fresh C1 tip in bay 2.",
+        default=False,
+    )
+    parameters.add_float(
+        variable_name="final_drain_mm",
+        display_name="Final depth below rim",
+        description="Final drain only. Enter the depth verified clear with a straight tip in A1.",
+        default=0.0, minimum=0.0, maximum=DECK_RIM_MM, unit="mm",
+    )
     parameters.add_str(
         variable_name="placement",
         display_name="Plate placement",
@@ -191,6 +208,24 @@ def confirm_shaker_idle(shaker):
         raise RuntimeError("Deactivate Heater-Shaker heating before the water checkout.")
 
 
+def drain_remaining_a1(protocol, p300, well, waste, depth_below_rim):
+    p300.pick_up_tip()
+    p300.move_to(well.top(z=7), speed=38)
+    protocol.pause("Confirm a straight tip is centered over the remaining water in A1.")
+    p300.prepare_to_aspirate()
+    target = well.top(z=-depth_below_rim)
+    p300.move_to(target, speed=6, force_direct=True)
+    protocol.pause("Resume only if the tip is straight and its opening is in the water.")
+    p300.flow_rate.aspirate = 12
+    p300.flow_rate.dispense = 45
+    p300.aspirate(WASH_UL, target)
+    protocol.delay(seconds=1)
+    p300.move_to(well.top(z=7), speed=12, force_direct=True)
+    p300.dispense(WASH_UL, waste)
+    p300.drop_tip()
+    protocol.home()
+
+
 def run(protocol: protocol_api.ProtocolContext):
     params = protocol.params
     on_shaker = params.placement == "shaker"
@@ -202,6 +237,10 @@ def run(protocol: protocol_api.ProtocolContext):
     protocol.load_labware("opentrons_96_filtertiprack_1000ul", "6", label="Parked tall tip rack")
     p300 = protocol.load_instrument("p300_single_gen2", "right", tip_racks=[tips])
     first_tip_name = "B1" if params.a1_tip_used else "A1"
+    if params.final_drain_only:
+        if not on_shaker or params.whole_plate:
+            raise ValueError("Select Heater-Shaker 10 and A1 only for the final drain.")
+        first_tip_name = "C1"
     first_tip = tips[first_tip_name]
     p300.starting_tip = first_tip
 
@@ -217,6 +256,8 @@ def run(protocol: protocol_api.ProtocolContext):
         return
     if not 5 <= depth <= min(DECK_RIM_MM - 0.5, rim - 0.5):
         raise ValueError("Recheck the measured well depth and seated rim height.")
+    if params.final_drain_only and not 0 < params.final_drain_mm < depth:
+        raise ValueError("Enter a verified final drain depth above the A1 floor.")
 
     whole_plate = params.whole_plate
     span_x = params.span_x_mm if whole_plate else 0
@@ -233,7 +274,7 @@ def run(protocol: protocol_api.ProtocolContext):
     waste = waste_reservoir["A12"].top(z=-3)
     water_per_well = STARTING_WATER_UL + WASH_UL
     minimum_water_ml = (water_per_well * len(plate.wells()) + SOURCE_RESERVE_UL) / 1000
-    protocol.pause(
+    setup = (
         f"{holder_check} Verify A1 is back left, the plate is dry and the lids are off. "
         f"Check the right P300 and a fresh 200 uL filter tip at {first_tip_name} in bay 2. "
         "Verify both open reservoirs match NEST 360102. "
@@ -241,6 +282,13 @@ def run(protocol: protocol_api.ProtocolContext):
         "Leave bay 3 lane 12 (A12) empty for waste. Keep bay 11 clear beside the shaker. "
         "Clear other unused labware and cables from the travel path. Keep both modules idle."
     )
+    if params.final_drain_only:
+        setup = (
+            f"{holder_check} Confirm water remains in open plate A1, a fresh C1 tip "
+            "is in bay 2, and open waste lane A12 in bay 3 has room for 200 uL. "
+            "Keep bay 11 clear and both modules idle."
+        )
+    protocol.pause(setup)
     confirm_shaker_idle(shaker)
     if on_shaker:
         shaker.close_labware_latch()
@@ -249,6 +297,11 @@ def run(protocol: protocol_api.ProtocolContext):
 
     p300.move_to(first_tip.top(z=12), speed=40)
     protocol.pause(f"Check that the right P300 is centered over a fresh {first_tip_name} tip in bay 2.")
+
+    if params.final_drain_only:
+        confirm_shaker_idle(shaker)
+        drain_remaining_a1(protocol, p300, plate["A1"], waste, params.final_drain_mm)
+        return
 
     for index, well in enumerate(plate.wells()):
         p300.pick_up_tip()
